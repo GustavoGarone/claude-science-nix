@@ -5,6 +5,8 @@
   fetchurl,
   buildFHSEnv,
   writeShellScript,
+  writeText,
+  runCommandLocal,
   makeDesktopItem,
   bash,
   coreutils,
@@ -25,6 +27,16 @@
   libsodium,
   libssh,
   util-linux,
+  python3,
+  git,
+  nix,
+  path,
+  # Must speak the host nix-daemon's protocol; nixpkgs' default does.
+  nixPackage ? nix,
+  # Extra packages for the FHS /usr, e.g. `pkgs: [pkgs.R pkgs.quarto]`.
+  extraPkgs ? (_: []),
+  # What `nixpkgs#…` resolves to inside the app's sandbox.
+  nixpkgsPath ? path,
 }: let
   sources = lib.importJSON ./sources.json;
   inherit (sources) version;
@@ -93,34 +105,79 @@
     exec "$bin" "$@"
   '';
 
+  # Inside the app's inner sandbox there is no /etc/nix and nix.db is
+  # read-only, but /nix (with the daemon socket) is bound: talk to the host
+  # daemon and enable flakes from the environment. With no system registry
+  # there, `nixpkgs#…` would go to the global registry over the network, so
+  # point the global registry at a nixpkgs that is already in the store. Host
+  # registries (/etc/nix, ~/.config/nix) still take precedence where visible.
+  flakeRegistry = writeText "claude-science-flake-registry.json" (builtins.toJSON {
+    version = 2;
+    flakes = [
+      {
+        from = {
+          type = "indirect";
+          id = "nixpkgs";
+        };
+        to = {
+          type = "path";
+          path = "${nixpkgsPath}";
+        };
+      }
+    ];
+  });
+  nixScript = writeShellScript "nix" ''
+    if [ -z "''${NIX_REMOTE+x}" ] && [ -S /nix/var/nix/daemon-socket/socket ]; then
+      export NIX_REMOTE=daemon
+    fi
+    export NIX_CONFIG="extra-experimental-features = nix-command flakes
+    flake-registry = ${flakeRegistry}''${NIX_CONFIG:+
+    $NIX_CONFIG}"
+    export NIX_SSL_CERT_FILE=''${NIX_SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}
+    exec -a "''${0##*/}" ${nixPackage}/bin/nix "$@"
+  '';
+  # nix dispatches on argv[0], so every name is a link to the same script.
+  # hiPrio: a `nix` in extraPkgs must not replace it in the FHS /usr/bin.
+  nixWrapper = lib.hiPrio (runCommandLocal "claude-science-nix-wrapper" {} ''
+    mkdir -p $out/bin
+    for n in nix nix-build nix-shell nix-store nix-instantiate nix-env nix-collect-garbage; do
+      ln -s ${nixScript} $out/bin/$n
+    done
+  '');
+
   # The app's inner bubblewrap sandbox binds /usr /lib /lib64 /bin /sbin /opt
   # /nix and a list of /etc files, but never /run or /etc/static. An FHS
   # namespace puts bash at /bin/bash, the glibc loader at /lib64, and these
   # libraries in /usr/lib + /etc/ld.so.cache, all of which it binds through.
-  targetPkgs = _: [
-    unwrapped
-    bash
-    coreutils
-    bubblewrap
-    socat
-    procps
-    ripgrep
-    cacert
-    stdenv.cc.cc.lib # libstdc++ for the `sharp` module
-    # Same set as programs.nix-ld's defaults, for conda/micromamba binaries.
-    zlib
-    openssl
-    bzip2
-    curl
-    xz
-    libxml2
-    zstd
-    attr
-    acl
-    libsodium
-    libssh
-    util-linux
-  ];
+  targetPkgs = pkgs:
+    [
+      unwrapped
+      nixWrapper
+      python3 # /usr/bin/python3 is the default [conda].operon_python_bin
+      git # flakes in git repos
+      bash
+      coreutils
+      bubblewrap
+      socat
+      procps
+      ripgrep
+      cacert
+      stdenv.cc.cc.lib # libstdc++ for the `sharp` module
+      # Same set as programs.nix-ld's defaults, for conda/micromamba binaries.
+      zlib
+      openssl
+      bzip2
+      curl
+      xz
+      libxml2
+      zstd
+      attr
+      acl
+      libsodium
+      libssh
+      util-linux
+    ]
+    ++ extraPkgs pkgs;
 
   # buildFHSEnv links /etc/ssl/certs to /.host-etc/ssl/certs, which dangles
   # inside the app's sandbox (it binds /etc/ssl but not /.host-etc). Put a

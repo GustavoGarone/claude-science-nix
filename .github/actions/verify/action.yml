@@ -24,7 +24,8 @@ runs:
       run: |
         export MAMBA_ROOT_PREFIX="$RUNNER_TEMP/mamba"
         nix run nixpkgs#micromamba -- create -y -q -p "$RUNNER_TEMP/env" -c conda-forge python openssl
-        result-fhs/bin/claude-science-fhs-shell tests/inner-sandbox.sh "$RUNNER_TEMP/env"
+        nixpkgs=$(nix flake archive --json | jq -r .inputs.nixpkgs.path)
+        result-fhs/bin/claude-science-fhs-shell tests/inner-sandbox.sh "$RUNNER_TEMP/env" "$nixpkgs"
 
     # Logs end up in $RUNNER_TEMP/cs-home/.claude-science; workflows upload it on failure.
     - name: App test (headless, not logged in)

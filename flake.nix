@@ -16,6 +16,11 @@
           config.allowUnfree = true;
         }));
   in {
+    # Build against a project's own nixpkgs, e.g. to pin tools from its lock:
+    #   claude-science-nix.lib.mkClaudeScience pkgs {extraPkgs = p: [p.R];}
+    # `pkgs` must allow unfree (see README).
+    lib.mkClaudeScience = pkgs: args: pkgs.callPackage ./package.nix args;
+
     overlays.default = final: _: {
       claude-science = final.callPackage ./package.nix {};
     };

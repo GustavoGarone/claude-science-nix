@@ -4,13 +4,21 @@
 # same system binds as the app (taken from the 0.1.71 binary), no /run, no
 # /etc/static, a scrubbed environment. Doesn't run the app itself.
 #
-#   tests/inner-sandbox.sh <conda-env-prefix>
+#   tests/inner-sandbox.sh <conda-env-prefix> <nixpkgs-source-path>
 #
 # The env must be a conda-forge env with python and openssl (created outside
 # with micromamba); its binaries use the /lib64 loader like any non-Nix binary.
+# The nixpkgs path (this flake's locked input) lets `nix develop` on the
+# fixture flake run without network. A nix-daemon must be running on the host.
 set -euo pipefail
 
+if [ $# -ne 2 ]; then
+  echo "usage: $0 <conda-env-prefix> <nixpkgs-source-path>" >&2
+  exit 2
+fi
 env_prefix=$1
+nixpkgs=$2
+fixture=$(cd "$(dirname "$0")/fixtures/devshell" && pwd)
 fail=0
 check() {
   local name=$1; shift
@@ -38,7 +46,7 @@ for p in passwd group nsswitch.conf ld.so.cache ld.so.conf ld.so.conf.d ssl \
   ca-certificates pki localtime mime.types alternatives default bash.bashrc fonts; do # the app's list
   sandbox+=(--ro-bind-try "/etc/$p" "/etc/$p")
 done
-sandbox+=(--ro-bind "$env_prefix" /env --)
+sandbox+=(--ro-bind "$env_prefix" /env --ro-bind "$fixture" /fixture --)
 
 echo "--- Imitated inner sandbox"
 # The app binds no resolv.conf/hosts (its sandboxed processes go through its
@@ -56,5 +64,19 @@ ctx = ssl.create_default_context(cafile='/etc/ssl/certs/ca-certificates.crt')
 with socket.create_connection(('$ip', 443), timeout=30) as s:
     with ctx.wrap_socket(s, server_hostname='$host') as t:
         print(t.version())"
+
+echo "--- Nix inside the imitated sandbox"
+# A fresh derivation each run, so the daemon really builds something.
+probe="derivation { name = \"probe\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [\"-c\" \"echo $$-$(date +%s%N) > \$out\"]; }"
+check "/usr/bin/python3 runs" "${sandbox[@]}" /usr/bin/python3 -c 'import sys, ssl, sqlite3'
+check "nix reaches the host daemon" "${sandbox[@]}" nix store info
+check "nix evaluates" "${sandbox[@]}" nix eval --expr '1 + 1'
+check "nix builds through the daemon" "${sandbox[@]}" nix build --no-link --print-out-paths --impure --expr "$probe"
+check "nix-build dispatches through the wrapper" "${sandbox[@]}" nix-build --no-out-link -E "$probe"
+check "nix-shell dispatches through the wrapper" "${sandbox[@]}" nix-shell --version
+check "nixpkgs# resolves to the pinned registry entry" "${sandbox[@]}" bash -c \
+  "nix flake metadata --json nixpkgs | grep -qF '\"path\":\"$nixpkgs\"'"
+check "nix develop runs a flake devShell" "${sandbox[@]}" nix develop --no-write-lock-file \
+  --override-input nixpkgs "path:$nixpkgs" path:/fixture -c hello
 
 exit $fail
