@@ -33,7 +33,12 @@
       pkg = self.packages.${pkgs.stdenv.hostPlatform.system}.claude-science;
       app = {
         type = "app";
-        program = lib.getExe pkg;
+        # With no arguments the binary prints help and exits 4; make
+        # `nix run` start the app instead.
+        program = toString (pkgs.writeShellScript "claude-science-run" ''
+          if [ $# -eq 0 ]; then set -- serve; fi
+          exec ${lib.getExe pkg} "$@"
+        '');
         meta.description = pkg.meta.description;
       };
     in {

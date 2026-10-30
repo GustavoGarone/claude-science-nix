@@ -7,7 +7,7 @@ Claude Science is proprietary (`meta.license = unfree`); you need `allowUnfree`.
 ## Usage
 
 ```bash
-nix run github:GustavoGarone/claude-science-nix -- serve
+nix run github:GustavoGarone/claude-science-nix   # runs `serve` when given no arguments
 ```
 
 As a flake input:

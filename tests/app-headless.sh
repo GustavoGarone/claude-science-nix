@@ -37,9 +37,15 @@ for _ in $(seq 60); do
 done
 check "daemon answers /health after the launcher exited" test "$healthy" = 1
 info "status" timeout 30 "$app" status < /dev/null
-info "auto-update setting in status/logs" bash -c "grep -rhoiE 'auto.?update[^,}]{0,40}' '$HOME/.claude-science' 2>/dev/null | sort | uniq -c | head"
+info "sandbox status" timeout 60 "$app" sandbox status < /dev/null
+info "mcp-env-check" timeout 300 "$app" mcp-env-check < /dev/null
+info "daemon log: update/engine/sandbox lines" bash -c "timeout 30 '$app' logs < /dev/null | grep -iE 'updat|engine|prefetch|sandbox|bwrap|error' | cut -c1-300 | head -60"
 check "stop" timeout 60 "$app" stop < /dev/null
 check "daemon is gone after stop" bash -c "sleep 3; ! curl -fsS http://127.0.0.1:$port/health"
+# Desktop launcher path: does 'open' start a daemon when none is running?
+info "open without a running daemon" env BROWSER=true timeout 60 "$app" open < /dev/null
+info "status after open" bash -c "timeout 30 '$app' status < /dev/null | head -5"
+info "cleanup stop" timeout 60 "$app" stop < /dev/null
 check "nothing installed to ~/.local/bin" bash -c "! ls '$HOME/.local/bin' 2>/dev/null | grep -q ."
 
 exit $fail
