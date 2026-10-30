@@ -5,11 +5,11 @@
   fetchurl,
   buildFHSEnv,
   writeShellScript,
-  writeText,
-  runCommandLocal,
+  writeShellScriptBin,
   makeDesktopItem,
   bash,
   coreutils,
+  findutils,
   bubblewrap,
   socat,
   procps,
@@ -29,14 +29,8 @@
   util-linux,
   python3,
   git,
-  nix,
-  path,
-  # Must speak the host nix-daemon's protocol; nixpkgs' default does.
-  nixPackage ? nix,
   # Extra packages for the FHS /usr, e.g. `pkgs: [pkgs.R pkgs.quarto]`.
   extraPkgs ? (_: []),
-  # What `nixpkgs#…` resolves to inside the app's sandbox.
-  nixpkgsPath ? path,
 }: let
   sources = lib.importJSON ./sources.json;
   inherit (sources) version;
@@ -105,45 +99,90 @@
     exec "$bin" "$@"
   '';
 
-  # Inside the app's inner sandbox there is no /etc/nix and nix.db is
-  # read-only, but /nix (with the daemon socket) is bound: talk to the host
-  # daemon and enable flakes from the environment. With no system registry
-  # there, `nixpkgs#…` would go to the global registry over the network, so
-  # point the global registry at a nixpkgs that is already in the store. Host
-  # registries (/etc/nix, ~/.config/nix) still take precedence where visible.
-  flakeRegistry = writeText "claude-science-flake-registry.json" (builtins.toJSON {
-    version = 2;
-    flakes = [
-      {
-        from = {
-          type = "indirect";
-          id = "nixpkgs";
-        };
-        to = {
-          type = "path";
-          path = "${nixpkgsPath}";
-        };
-      }
-    ];
-  });
-  nixScript = writeShellScript "nix" ''
-    if [ -z "''${NIX_REMOTE+x}" ] && [ -S /nix/var/nix/daemon-socket/socket ]; then
-      export NIX_REMOTE=daemon
+  # The app finds bwrap on PATH, so this shim stands in for it and adds
+  # read-only binds of the NixOS paths its sandbox never binds: system and
+  # per-user profiles (on the sandbox's fixed PATH via
+  # /run/current-system/sw/bin) and /etc/static, which /etc symlinks point
+  # into. The real sandbox call rebuilds /etc with `--tmpfs /etc`, so there
+  # the binds go just before the `--` ending bwrap's options, after the app's
+  # own; other calls (capability probes) get them first, where they are
+  # harmless. Seccomp and network setup run after `--` and are untouched.
+  # This relies on the shape of the app's argv (checked on 0.1.71: options
+  # inline, `--tmpfs /etc` as two words, first `--` ends them); if a release
+  # changes it, /etc/static links dangle again, and the debug log shows why.
+  # Everything bound is in /nix/store, which the sandbox already reads.
+  # Adapted from leuflatworm/nix-claude-science (MIT).
+  bwrapShim = lib.hiPrio (writeShellScriptBin "bwrap" ''
+    # Debug log, opt-in by creating the file yourself (the app clears the
+    # environment, so no variable reaches here). argv may hold proxy secrets.
+    log=/tmp/claude-science-bwrap.log
+    if [ -f "$log" ] && [ -O "$log" ] && [ ! -L "$log" ]; then
+      { printf '%q ' "$@"; printf '\n'; } >> "$log" 2>/dev/null || true
     fi
-    export NIX_CONFIG="extra-experimental-features = nix-command flakes
-    flake-registry = ${flakeRegistry}''${NIX_CONFIG:+
-    $NIX_CONFIG}"
-    export NIX_SSL_CERT_FILE=''${NIX_SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}
-    exec -a "''${0##*/}" ${nixPackage}/bin/nix "$@"
-  '';
-  # nix dispatches on argv[0], so every name is a link to the same script.
-  # hiPrio: a `nix` in extraPkgs must not replace it in the FHS /usr/bin.
-  nixWrapper = lib.hiPrio (runCommandLocal "claude-science-nix-wrapper" {} ''
-    mkdir -p $out/bin
-    for n in nix nix-build nix-shell nix-store nix-instantiate nix-env nix-collect-garbage; do
-      ln -s ${nixScript} $out/bin/$n
+    extra=()
+    for p in /run/current-system /run/opengl-driver /etc/profiles /etc/static; do
+      extra+=(--ro-bind-try "$p" "$p")
     done
+    tmpfs_etc=0
+    prev=
+    for a in "$@"; do
+      if [ "$prev" = --tmpfs ] && [ "$a" = /etc ]; then tmpfs_etc=1; break; fi
+      prev=$a
+    done
+    args=()
+    if [ "$tmpfs_etc" = 1 ]; then
+      spliced=0
+      for a in "$@"; do
+        if [ "$spliced" = 0 ] && [ "$a" = -- ]; then
+          args+=("''${extra[@]}" --)
+          spliced=1
+        else
+          args+=("$a")
+        fi
+      done
+      if [ "$spliced" = 0 ]; then args=("''${extra[@]}" "$@"); fi
+    else
+      args=("''${extra[@]}" "$@")
+    fi
+    exec ${bubblewrap}/bin/bwrap "''${args[@]}"
   '');
+
+  # Runs a command in a project's Nix dev shell inside the app's sandbox,
+  # where nix itself can't reach the daemon (seccomp blocks AF_UNIX sockets).
+  # It sources the environment nix-direnv already built on the host, which
+  # only refers to /nix/store, and refuses one older than the flake.
+  nixEnvRun = writeShellScriptBin "nix-env-run" ''
+    if [ $# -lt 3 ] || [ "$2" != -- ]; then
+      echo "usage: nix-env-run <project-dir> -- <command> [args...]" >&2
+      exit 2
+    fi
+    dir=$1
+    shift 2
+    orig=$PWD
+    cd "$dir" || exit 1
+    rc=
+    for f in .direnv/flake-profile-*.rc; do
+      if [ -f "$f" ] && { [ -z "$rc" ] || [ "$f" -nt "$rc" ]; }; then rc=$f; fi
+    done
+    if [ -z "$rc" ]; then
+      echo "nix-env-run: no nix-direnv environment in $dir/.direnv; run 'direnv allow' there in a terminal outside Claude Science" >&2
+      exit 1
+    fi
+    # Like nix-direnv's own check, by mtime, but also over every .nix file a
+    # flake may import.
+    newer=$(${findutils}/bin/find . \( -name .git -o -name .direnv -o -name node_modules \) -prune \
+      -o \( -name flake.lock -o -name '*.nix' \) -newer "$rc" -print -quit)
+    if [ -n "$newer" ]; then
+      echo "nix-env-run: $dir/$rc is older than $newer; run 'direnv reload' in $dir in a terminal outside Claude Science" >&2
+      exit 1
+    fi
+    # The shellHook runs in the project dir and may print; keep stdout for
+    # the command, and the caller's cwd for its relative paths.
+    # shellcheck disable=SC1090
+    source "$rc" >&2
+    cd "$orig" || exit 1
+    exec "$@"
+  '';
 
   # The app's inner bubblewrap sandbox binds /usr /lib /lib64 /bin /sbin /opt
   # /nix and a list of /etc files, but never /run or /etc/static. An FHS
@@ -152,9 +191,10 @@
   targetPkgs = pkgs:
     [
       unwrapped
-      nixWrapper
+      bwrapShim
+      nixEnvRun
       python3 # /usr/bin/python3 is the default [conda].operon_python_bin
-      git # flakes in git repos
+      git
       bash
       coreutils
       bubblewrap

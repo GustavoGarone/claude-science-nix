@@ -42,19 +42,22 @@ To inspect the namespace, use `nix run .#fhs-shell`.
 
 `/usr/bin/python3` is included because the app's control kernel uses it by default (`[conda].operon_python_bin`).
 
-### Nix inside the sandbox
+### Host packages and Nix shells inside the sandbox
 
-Commands the agent runs see only that FHS `/usr`, plus `/nix`. `/run/current-system`, `/etc/profiles/per-user/*` and `~/.nix-profile` are not mounted, so host packages are not on its `PATH`. Use Nix shells instead: the FHS has a `nix` wrapper (also `nix-shell`, `nix-build`, …) that talks to the host's nix-daemon through `/nix/var/nix/daemon-socket` and turns on flakes, because `/etc/nix` isn't visible there either. So the agent can run a project's own pinned toolchain:
+The app finds `bwrap` on `PATH`, so the FHS puts a shim in front of it, adapted from [leuflatworm/nix-claude-science](https://github.com/leuflatworm/nix-claude-science) (MIT). The shim adds read-only binds of `/run/current-system`, `/etc/profiles`, `/etc/static` and `/run/opengl-driver` to the app's sandbox. System packages are then on the sandbox's fixed `PATH` (it includes `/run/current-system/sw/bin`), and links into those paths resolve. `/etc/profiles/per-user/$USER/bin` (NixOS-integrated Home Manager) is visible but not on `PATH`. Nothing under your home is added, so `~/.nix-profile` stays unreachable. The shim leaves the app's seccomp filter and network setup alone. Everything it binds lives in `/nix/store`, which the sandbox can already read, so sandboxed code sees nothing new, only by more convenient paths. That includes the generated NixOS `/etc` in `/etc/static`; files kept outside the store, such as `/etc/shadow` or ssh host keys, stay hidden. The shim recognizes the app's real sandbox call by its argv shape, checked on 0.1.71. If a release changes that shape, use the debug log below to see why the binds are missing.
+
+`nix` itself can't work in there: the app's seccomp filter blocks creating any Unix socket, so it can't reach the nix-daemon. We don't lift that. Daemon access would let sandboxed code build fixed-output derivations, which fetch any URL from outside the app's network approval, and write to the store. Instead, prepare a project's dev shell outside the sandbox with [nix-direnv](https://github.com/nix-community/nix-direnv), and run commands in it with `nix-env-run`:
 
 ```bash
-nix develop ~/projetos/my-project -c Rscript analysis.R
-nix shell nixpkgs#samtools -c samtools --version
+# in a terminal, once and after each flake change (nix-direnv also keeps it from being garbage-collected):
+cd ~/projetos/my-project && direnv allow    # or: direnv reload
+# inside Claude Science:
+nix-env-run ~/projetos/my-project -- Rscript analysis.R
 ```
 
-- Grant the project folder to Claude Science, read-write if its `shellHook` writes files.
-- Locked flake inputs already in the store need no network. New downloads go through the app's network approval proxy.
-- `nixpkgs#…` resolves to the nixpkgs this package was built with, which is already in the store, because the host's registry in `/etc/nix` isn't visible in the sandbox. The wrapper replaces the global registry, so other global ids (`flake-utils#…`, `templates#…`) don't resolve there; use full refs such as `github:numtide/flake-utils`. Where `/etc/nix/registry.json` is visible, as in `fhs-shell`, its pins win.
-- The wrapper uses the daemon only when `/nix/var/nix/daemon-socket/socket` exists. Without a daemon, `nix` can't build inside the app's sandbox, where the store is read-only.
+`nix-env-run` sources the newest `.direnv/flake-profile-*.rc`, which refers only to `/nix/store`. It refuses one older than `flake.lock` or any `.nix` file in the project. Like nix-direnv's own check, this goes by modification time: a change to some other file the flake reads goes unnoticed, and a checkout that only touches a file can ask for an unnecessary reload. Grant the project folder to Claude Science, read-write if its `shellHook` writes files.
+
+To see the sandbox calls, create the log file yourself: `install -m600 /dev/null /tmp/claude-science-bwrap.log`. The shim appends each call's arguments while the file exists, and the file grows with every call. Delete it as soon as you're done, since the arguments can include the proxy's credentials.
 
 For tools that should always be on `PATH`, without a Nix shell, add them to the FHS:
 
@@ -73,13 +76,11 @@ pkgs = import nixpkgs {
 };
 ```
 
-That `pkgs` also supplies the `nix` the wrapper runs (override with `nixPackage`). It must speak the host daemon's protocol, which a nixpkgs from the last couple of years does.
-
-If `extraPkgs` contains files that are also in the base set, `extraPkgs` wins, except for the `nix` wrapper, which keeps priority so `/usr/bin/nix` still works in the sandbox. Putting another Python there also changes `/usr/bin/python3`, which the app's control kernel runs.
+If `extraPkgs` contains files that are also in the base set, `extraPkgs` wins, except for the `bwrap` shim, which keeps priority. Putting another Python there also changes `/usr/bin/python3`, which the app's control kernel runs.
 
 ### SSH
 
-The sandbox gets neither `~/.ssh` nor `SSH_AUTH_SOCK`: the app strips that variable, and `/run` isn't mounted. The app's own SSH remote-compute connections are made by the daemon, outside that sandbox, using your ssh-agent. Start the daemon from a session where `SSH_AUTH_SOCK` is set. A desktop session normally sets it, so the desktop launcher works.
+The sandbox gets neither `~/.ssh` nor `SSH_AUTH_SOCK`: the app strips that variable, and `/run/user` (where the agent socket lives) isn't mounted. The app's own SSH remote-compute connections are made by the daemon, outside that sandbox, using your ssh-agent. Start the daemon from a session where `SSH_AUTH_SOCK` is set. A desktop session normally sets it, so the desktop launcher works.
 
 ## Updates
 
@@ -103,7 +104,7 @@ nix develop -c scripts/update.sh [--check|--dry-run|--force]
 CI (`.github/actions/verify`, run on every push, PR and auto-update) does:
 
 - `nix flake check`: build, `sources.json` schema, shellcheck, formatting.
-- `tests/inner-sandbox.sh`: inside the FHS env, imitates the app's inner sandbox (its bind list, no `/run`, scrubbed env) and checks `/bin/bash`, TLS validation with curl and with a conda-forge Python, that the conda-forge Python loads its C extensions, `/usr/bin/python3`, and that `nix` reaches the daemon, builds, and runs `nix develop` on a fixture flake. It doesn't run the app. Without the FHS env every check fails.
+- `tests/inner-sandbox.sh`: inside the FHS env, imitates the app's inner sandbox (its bind list, no `/run`, scrubbed env) and checks `/bin/bash`, TLS validation with curl and with a conda-forge Python, that the conda-forge Python loads its C extensions, `/usr/bin/python3`, the binds the `bwrap` shim adds (on NixOS), and `nix-env-run`. It can't imitate the app's seccomp filter. It doesn't run the app. Without the FHS env every check fails.
 - `tests/app-headless.sh`: runs the app without logging in: `--version`, `serve --detached`, `/health`, `stop`, refused `update`, nothing written to `~/.local/bin`.
 
 Not covered (needs a logged-in session): conda environments created by the app, MCP connectors, `sharp` rendering.
