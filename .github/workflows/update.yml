@@ -1,0 +1,103 @@
+name: Update
+
+# Bumps sources.json (every 6 hours) and flake.lock (weekly), verifies the
+# result, and pushes straight to main. Nothing is committed if verification
+# fails; a single tracking issue is opened or commented on instead.
+
+on:
+  schedule:
+    - cron: "23 */6 * * *" # Claude Science release
+    - cron: "41 4 * * 1" # flake.lock, Mondays
+  workflow_dispatch:
+    inputs:
+      lock:
+        description: Also run `nix flake update`
+        type: boolean
+        default: false
+      dry-run:
+        description: Verify but don't push
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump Claude Science
+        id: sources
+        run: ./scripts/update.sh
+
+      - name: Bump flake.lock
+        id: lock
+        if: github.event.schedule == '41 4 * * 1' || inputs.lock
+        run: |
+          nix flake update
+          if git diff --quiet flake.lock; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify
+        if: steps.sources.outputs.updated == 'true' || steps.lock.outputs.updated == 'true'
+        uses: ./.github/actions/verify
+
+      - name: Upload app logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: claude-science-logs
+          path: ${{ runner.temp }}/cs-home/.claude-science
+          if-no-files-found: ignore
+
+      - name: Commit and push
+        if: (steps.sources.outputs.updated == 'true' || steps.lock.outputs.updated == 'true') && !inputs.dry-run
+        env:
+          SOURCES_UPDATED: ${{ steps.sources.outputs.updated }}
+          LOCK_UPDATED: ${{ steps.lock.outputs.updated }}
+          OLD: ${{ steps.sources.outputs.old }}
+          NEW: ${{ steps.sources.outputs.new }}
+        run: |
+          if [ "$SOURCES_UPDATED" = true ]; then
+            msg="claude-science: $OLD -> $NEW"
+            [ "$LOCK_UPDATED" = true ] && msg="$msg, flake.lock: update"
+          else
+            msg="flake.lock: update"
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sources.json flake.lock
+          git commit -m "$msg"
+          git push origin HEAD:main
+
+      - name: Report failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NEW: ${{ steps.sources.outputs.new }}
+        run: |
+          title="Auto-update failed"
+          body="Run $RUN_URL failed (upstream version: ${NEW:-unknown})."
+          issue=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

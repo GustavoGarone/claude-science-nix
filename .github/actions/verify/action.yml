@@ -1,0 +1,34 @@
+name: Verify
+description: Check and build the flake, then run the runtime tests (Nix must already be installed)
+
+runs:
+  using: composite
+  steps:
+    - name: Flake check
+      shell: bash
+      run: nix flake check -L
+
+    - name: Build
+      shell: bash
+      run: |
+        nix build .#claude-science -L
+        nix build .#fhs-shell -L -o result-fhs
+
+    # Ubuntu 24.04 blocks the unprivileged user namespaces bubblewrap needs.
+    - name: Allow user namespaces
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+    - name: Inner-sandbox test (without the app)
+      shell: bash
+      run: |
+        export MAMBA_ROOT_PREFIX="$RUNNER_TEMP/mamba"
+        nix run nixpkgs#micromamba -- create -y -q -p "$RUNNER_TEMP/env" -c conda-forge python openssl
+        result-fhs/bin/claude-science-fhs-shell tests/inner-sandbox.sh "$RUNNER_TEMP/env"
+
+    # Logs end up in $RUNNER_TEMP/cs-home/.claude-science; workflows upload it on failure.
+    - name: App test (headless, not logged in)
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/cs-home"
+        HOME="$RUNNER_TEMP/cs-home" tests/app-headless.sh "$PWD/result/bin/claude-science"
