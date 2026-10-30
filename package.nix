@@ -217,6 +217,24 @@
       libssh
       util-linux
     ]
+    # Small tools agents reach for to inspect files, JSON and PDFs. Heavy
+    # ones (pandoc, imagemagick, ffmpeg, gcc) are left to extraPkgs.
+    ++ (with pkgs; [
+      jq
+      yq-go
+      unzip
+      zip
+      (lib.getBin file)
+      (lib.getBin sqlite)
+      bc
+      poppler-utils
+      fd
+      tree
+      which
+      gnupatch
+      wget
+      gnumake
+    ])
     ++ extraPkgs pkgs;
 
   # buildFHSEnv links /etc/ssl/certs to /.host-etc/ssl/certs, which dangles

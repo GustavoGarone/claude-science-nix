@@ -59,10 +59,12 @@ nix-env-run ~/projetos/my-project -- Rscript analysis.R
 
 To see the sandbox calls, create the log file yourself: `install -m600 /dev/null /tmp/claude-science-bwrap.log`. The shim appends each call's arguments while the file exists, and the file grows with every call. Delete it as soon as you're done, since the arguments can include the proxy's credentials.
 
-For tools that should always be on `PATH`, without a Nix shell, add them to the FHS:
+The FHS already has a small set of tools agents commonly use: `jq`, `yq`, `unzip`/`zip`, `file`, `sqlite3`, `bc`, poppler-utils (`pdftotext`, `pdfinfo`, `pdftoppm`, …), `fd`, `tree`, `which`, `patch`, `wget` and `make`, besides git, curl, ripgrep and the usual shell utilities. For one-off tools, the agent can also use the app's conda environments (for example `poppler` or `samtools` from conda-forge), whose downloads go through the app's network approval.
+
+For other tools that should always be on `PATH`, without a Nix shell, add them to the FHS. Heavier ones are left out of the default set for that reason:
 
 ```nix
-claude-science.override {extraPkgs = pkgs: [pkgs.R pkgs.quarto];}
+claude-science.override {extraPkgs = pkgs: with pkgs; [pandoc imagemagick ffmpeg gcc R quarto];}
 # or, built with a project's own nixpkgs (its lock's versions):
 inputs.claude-science-nix.lib.mkClaudeScience pkgs {extraPkgs = p: [p.R];}
 ```
