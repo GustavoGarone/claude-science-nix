@@ -1,8 +1,8 @@
 {
-  "version": "0.1.72",
-  "buildDate": "2026-11-03T19:16:36Z",
-  "sha8": "ab73accb",
+  "version": "0.1.73",
+  "buildDate": "2026-11-19T00:19:31Z",
+  "sha8": "e5f7fdda",
   "hashes": {
-    "x86_64-linux": "sha256-urSItnnJyXugy0UJPf9t+tR693/60Ep/mnvs4F8+34E="
+    "x86_64-linux": "sha256-v8qo3EuJzfM5eky/fSXbaFuCh2wXmZC2I9T6AyD5sII="
   }
 }
